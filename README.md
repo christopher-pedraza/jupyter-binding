@@ -45,8 +45,7 @@ The config file is sourced as shell code, so only use files you trust.
 ## Session end time and warnings
 
 The URL banner shows when the session started and when it will end. While the tunnel is
-open, a live "time left" line is redrawn in place (`--countdown 0` / `JB_COUNTDOWN=0` turns
-it off). It is computed locally from the end time fetched once at startup, so it costs no
+open, a live "time left" line is redrawn in place (interactive terminals only). It is computed locally from the end time fetched once at startup, so it costs no
 remote calls.
 
 Optionally, `--warn-minutes N` (`JB_WARN_MINUTES`) prints a warning and rings the terminal

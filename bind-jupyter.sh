@@ -55,8 +55,6 @@ Other
   --poll-secs N          queue polling interval while waiting (default 5)   [JB_POLL_SECS]
   --check-secs N         how often to check the running job (default 30);
                          one tiny squeue call over the open connection      [JB_CHECK_SECS]
-  --countdown 0|1        show a live "time left" line while running (default 1;
-                         computed locally, no network)                      [JB_COUNTDOWN]
   --warn-minutes N       print a warning (and ring the terminal bell) when N
                          minutes remain. 0 = off (default). Costs no extra
                          remote calls: uses the end time fetched at startup [JB_WARN_MINUTES]
@@ -70,14 +68,14 @@ EOF
 
 # ---- settings: defaults < config file < JB_* env < flags --------------------------
 VARS=(TARGET SSH_KEY SSH_EXTRA LOCAL_PORT BIND_ADDRESS GRES TIME MEM CPUS PARTITION
-      ACCOUNT JOB_NAME CONDA_ENV SETUP_CMD JUPYTER_CMD POLL_SECS CHECK_SECS WARN_MINUTES COUNTDOWN)
+      ACCOUNT JOB_NAME CONDA_ENV SETUP_CMD JUPYTER_CMD POLL_SECS CHECK_SECS WARN_MINUTES)
 declare -A FLAG_MAP=(
     [--target]=TARGET [--ssh-key]=SSH_KEY [--ssh-extra]=SSH_EXTRA
     [--local-port]=LOCAL_PORT [--bind-address]=BIND_ADDRESS [--gres]=GRES
     [--time]=TIME [--mem]=MEM [--cpus]=CPUS [--partition]=PARTITION
     [--account]=ACCOUNT [--job-name]=JOB_NAME [--conda-env]=CONDA_ENV
     [--setup-cmd]=SETUP_CMD [--jupyter-cmd]=JUPYTER_CMD [--poll-secs]=POLL_SECS
-    [--check-secs]=CHECK_SECS [--warn-minutes]=WARN_MINUTES [--countdown]=COUNTDOWN
+    [--check-secs]=CHECK_SECS [--warn-minutes]=WARN_MINUTES
     [--config]=CONFIG
 )
 declare -A FROM_ENV=() FROM_FLAGS=()
@@ -142,7 +140,6 @@ default JB_JUPYTER_CMD "jupyter lab"
 default JB_POLL_SECS 5
 default JB_CHECK_SECS 30
 default JB_WARN_MINUTES 0
-default JB_COUNTDOWN 1
 
 # Values are interpolated into #SBATCH lines and ssh arguments: keep them boring.
 for v in GRES TIME MEM CPUS PARTITION ACCOUNT JOB_NAME; do
@@ -151,7 +148,6 @@ for v in GRES TIME MEM CPUS PARTITION ACCOUNT JOB_NAME; do
 done
 [[ $JB_LOCAL_PORT =~ ^[0-9]+$ && $JB_POLL_SECS =~ ^[0-9]+$ && $JB_CHECK_SECS =~ ^[1-9][0-9]*$ \
    && $JB_WARN_MINUTES =~ ^[0-9]+$ ]] || die "port, poll/check seconds and warn minutes must be numeric"
-[[ $JB_COUNTDOWN =~ ^[01]$ ]] || die "JB_COUNTDOWN must be 0 or 1"
 [[ $JB_BIND_ADDRESS =~ ^[0-9A-Za-z.:-]+$ ]] || die "invalid JB_BIND_ADDRESS"
 
 # ---- the Slurm job script ---------------------------------------------------------
@@ -346,9 +342,9 @@ show_times() {
     if (( end > now && start > 0 )); then
         here=$(date +%s)
         END_LOCAL=$(( here + (end - now) ))
-        TIME_INFO=$(printf 'Started : %s\nEnds    : %s  (limit %s, %s left)' \
+        TIME_INFO=$(printf 'Started : %s\nEnds    : %s  (limit %s)' \
             "$(fmt_ts $(( here - (now - start) )))" \
-            "$(fmt_ts $(( here + (end - now) )))" "$limit" "$(fmt_dur $(( end - now )))")
+            "$(fmt_ts $(( here + (end - now) )))" "$limit")
     else
         TIME_INFO="Ends    : no end time reported (limit: $limit)"
     fi
@@ -360,10 +356,10 @@ show_times
 clear_line() { if [[ -t 1 ]]; then printf '\r\033[K'; fi; }
 countdown() {
     local left
-    [[ $JB_COUNTDOWN == 1 && -t 1 && -n $END_LOCAL ]] || return 0
+    [[ -t 1 && -n $END_LOCAL ]] || return 0
     left=$(( END_LOCAL - $(date +%s) ))
     (( left > 0 )) || left=0
-    printf '\r\033[K%s left (ends %s) - Ctrl-C to stop' "$(fmt_dur "$left")" "$(fmt_ts "$END_LOCAL")"
+    printf '\r\033[K%s left - Ctrl-C to stop' "$(fmt_dur "$left")"
 }
 
 # Local-only check (no network): warn once when JB_WARN_MINUTES or less remain.
