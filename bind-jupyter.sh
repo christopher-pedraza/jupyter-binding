@@ -52,7 +52,14 @@ Other
                          jupyter-binding.env.example). Default: first found of
                          <script dir>/jupyter-binding.env,
                          ~/.config/jupyter-binding/config.env               [JB_CONFIG]
-  --poll-secs N          queue polling interval (default 5)                 [JB_POLL_SECS]
+  --poll-secs N          queue polling interval while waiting (default 5)   [JB_POLL_SECS]
+  --check-secs N         how often to check the running job (default 30);
+                         one tiny squeue call over the open connection      [JB_CHECK_SECS]
+  --countdown 0|1        show a live "time left" line while running (default 1;
+                         computed locally, no network)                      [JB_COUNTDOWN]
+  --warn-minutes N       print a warning (and ring the terminal bell) when N
+                         minutes remain. 0 = off (default). Costs no extra
+                         remote calls: uses the end time fetched at startup [JB_WARN_MINUTES]
   --dry-run              print the generated Slurm script and exit (no SSH)
   -h, --help             show this help
 
@@ -63,13 +70,14 @@ EOF
 
 # ---- settings: defaults < config file < JB_* env < flags --------------------------
 VARS=(TARGET SSH_KEY SSH_EXTRA LOCAL_PORT BIND_ADDRESS GRES TIME MEM CPUS PARTITION
-      ACCOUNT JOB_NAME CONDA_ENV SETUP_CMD JUPYTER_CMD POLL_SECS)
+      ACCOUNT JOB_NAME CONDA_ENV SETUP_CMD JUPYTER_CMD POLL_SECS CHECK_SECS WARN_MINUTES COUNTDOWN)
 declare -A FLAG_MAP=(
     [--target]=TARGET [--ssh-key]=SSH_KEY [--ssh-extra]=SSH_EXTRA
     [--local-port]=LOCAL_PORT [--bind-address]=BIND_ADDRESS [--gres]=GRES
     [--time]=TIME [--mem]=MEM [--cpus]=CPUS [--partition]=PARTITION
     [--account]=ACCOUNT [--job-name]=JOB_NAME [--conda-env]=CONDA_ENV
     [--setup-cmd]=SETUP_CMD [--jupyter-cmd]=JUPYTER_CMD [--poll-secs]=POLL_SECS
+    [--check-secs]=CHECK_SECS [--warn-minutes]=WARN_MINUTES [--countdown]=COUNTDOWN
     [--config]=CONFIG
 )
 declare -A FROM_ENV=() FROM_FLAGS=()
@@ -132,13 +140,18 @@ default JB_CONDA_ENV ""
 default JB_SETUP_CMD ""
 default JB_JUPYTER_CMD "jupyter lab"
 default JB_POLL_SECS 5
+default JB_CHECK_SECS 30
+default JB_WARN_MINUTES 0
+default JB_COUNTDOWN 1
 
 # Values are interpolated into #SBATCH lines and ssh arguments: keep them boring.
 for v in GRES TIME MEM CPUS PARTITION ACCOUNT JOB_NAME; do
     name=JB_$v
     [[ ${!name} =~ ^[A-Za-z0-9_.:,+=/-]*$ ]] || die "invalid characters in $name"
 done
-[[ $JB_LOCAL_PORT =~ ^[0-9]+$ && $JB_POLL_SECS =~ ^[0-9]+$ ]] || die "port/poll must be numeric"
+[[ $JB_LOCAL_PORT =~ ^[0-9]+$ && $JB_POLL_SECS =~ ^[0-9]+$ && $JB_CHECK_SECS =~ ^[1-9][0-9]*$ \
+   && $JB_WARN_MINUTES =~ ^[0-9]+$ ]] || die "port, poll/check seconds and warn minutes must be numeric"
+[[ $JB_COUNTDOWN =~ ^[01]$ ]] || die "JB_COUNTDOWN must be 0 or 1"
 [[ $JB_BIND_ADDRESS =~ ^[0-9A-Za-z.:-]+$ ]] || die "invalid JB_BIND_ADDRESS"
 
 # ---- the Slurm job script ---------------------------------------------------------
@@ -315,6 +328,57 @@ echo "3. Jupyter is up on $NODE:$PORT. Opening tunnel on port $JB_LOCAL_PORT..."
 open_tunnel
 rssh_retry "rm -f ~/.jupyter_binding/$JOBID.ready"
 
+# Sets TIME_INFO (printed in the banner) from Slurm's own start/end/limit for the job.
+# Uses the cluster's clock only to measure "elapsed" and "remaining", so clock or
+# timezone differences between the cluster and this machine don't matter.
+END_LOCAL=""; WARNED=0
+fmt_ts() { date -d "@$1" '+%a %d %b %H:%M' 2>/dev/null || date -r "$1" '+%a %d %b %H:%M'; }
+fmt_dur() { local m=$(( $1 / 60 )); printf '%dh %02dm' $(( m / 60 )) $(( m % 60 )); }
+show_times() {
+    local out start end now limit here
+    TIME_INFO=""; END_LOCAL=""
+    out=$(rssh_retry "r=\$(squeue -h -j $JOBID -o '%S|%e|%l' 2>/dev/null | head -n1)
+                IFS='|' read -r s e l <<< \"\$r\"
+                echo \"TIMES \$(date -d \"\$s\" +%s 2>/dev/null || echo 0) \$(date -d \"\$e\" +%s 2>/dev/null || echo 0) \$(date +%s) \${l:-unknown}\"") \
+        || return 0
+    read -r _ start end now limit <<< "$out"
+    [[ $start =~ ^[0-9]+$ && $end =~ ^[0-9]+$ && $now =~ ^[0-9]+$ ]] || return 0
+    if (( end > now && start > 0 )); then
+        here=$(date +%s)
+        END_LOCAL=$(( here + (end - now) ))
+        TIME_INFO=$(printf 'Started : %s\nEnds    : %s  (limit %s, %s left)' \
+            "$(fmt_ts $(( here - (now - start) )))" \
+            "$(fmt_ts $(( here + (end - now) )))" "$limit" "$(fmt_dur $(( end - now )))")
+    else
+        TIME_INFO="Ends    : no end time reported (limit: $limit)"
+    fi
+}
+
+show_times
+
+# Terminal helpers. The countdown redraws one line in place, so clear it before other output.
+clear_line() { if [[ -t 1 ]]; then printf '\r\033[K'; fi; }
+countdown() {
+    local left
+    [[ $JB_COUNTDOWN == 1 && -t 1 && -n $END_LOCAL ]] || return 0
+    left=$(( END_LOCAL - $(date +%s) ))
+    (( left > 0 )) || left=0
+    printf '\r\033[K%s left (ends %s) - Ctrl-C to stop' "$(fmt_dur "$left")" "$(fmt_ts "$END_LOCAL")"
+}
+
+# Local-only check (no network): warn once when JB_WARN_MINUTES or less remain.
+maybe_warn() {
+    local left
+    (( JB_WARN_MINUTES > 0 && WARNED == 0 )) || return 0
+    [[ -n $END_LOCAL ]] || return 0
+    left=$(( END_LOCAL - $(date +%s) ))
+    (( left <= JB_WARN_MINUTES * 60 )) || return 0
+    WARNED=1
+    clear_line
+    printf '\a'
+    echo "!! Session ends at $(fmt_ts "$END_LOCAL") (~$(( (left + 59) / 60 )) min left). Save your work."
+}
+
 case $JB_BIND_ADDRESS in
     0.0.0.0)
         URL_HOST=$(ip route get 1.1.1.1 2>/dev/null \
@@ -329,20 +393,28 @@ echo
 echo "================================================="
 echo "Jupyter URL (VS Code: Select Kernel > Existing Jupyter Server):"
 printf '\033[1;33mhttp://%s:%s/?token=%s\033[0m\n' "$URL_HOST" "$JB_LOCAL_PORT" "$TOKEN"
+[[ -z $TIME_INFO ]] || echo "$TIME_INFO"
 echo "Keep this terminal open. Ctrl-C cancels the job and closes the tunnel."
 echo "================================================="
 
 # Hold the tunnel open until the job ends; re-create it if the connection drops.
-unknown=0
-while sleep 30; do
+# The local display (countdown, warning) ticks every 15 s at no cost; the job itself is
+# only checked remotely every JB_CHECK_SECS.
+unknown=0 next_check=$SECONDS
+countdown
+while sleep 15; do
+    maybe_warn
+    countdown
+    (( SECONDS >= next_check )) || continue
+    next_check=$(( SECONDS + JB_CHECK_SECS ))
     if ! ssh "${SSH_OPTS[@]}" -O check "$TARGET" 2>/dev/null; then
-        echo "SSH connection dropped, reconnecting..." >&2
+        clear_line; echo "SSH connection dropped, reconnecting..." >&2
         open_tunnel || { echo "Reconnect failed; will retry." >&2; continue; }
     fi
     poll || continue
     case $STATE in
-        UNKNOWN*) if (( ++unknown >= 6 )); then echo "Lost track of job $JOBID." >&2; break; fi ;;
+        UNKNOWN*) if (( ++unknown >= 6 )); then clear_line; echo "Lost track of job $JOBID." >&2; break; fi ;;
         RUNNING*|PENDING*|COMPLETING*) unknown=0 ;;
-        *) echo "Job ended ($STATE)."; break ;;
+        *) clear_line; echo "Job ended ($STATE)."; break ;;
     esac
 done

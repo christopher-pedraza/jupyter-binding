@@ -26,7 +26,9 @@ options; `--dry-run` prints the generated Slurm script without connecting.
 2. Pipes a generated Slurm script to `sbatch` over stdin. Nothing is installed on the cluster
    except small state files in `~/.jupyter_binding/`.
 3. The job picks a free random port and a random token, starts Jupyter, and reports back.
-4. The script forwards `BIND_ADDRESS:LOCAL_PORT` to the compute node and prints the URL.
+4. The script forwards `BIND_ADDRESS:LOCAL_PORT` to the compute node and prints the URL,
+   plus when your session started and when it will end (taken from Slurm's own start/end
+   times for the job, shown in your local time zone).
 
 ## Configuration
 
@@ -39,6 +41,18 @@ options go after `--`:
 ```
 
 The config file is sourced as shell code, so only use files you trust.
+
+## Session end time and warnings
+
+The URL banner shows when the session started and when it will end. While the tunnel is
+open, a live "time left" line is redrawn in place (`--countdown 0` / `JB_COUNTDOWN=0` turns
+it off). It is computed locally from the end time fetched once at startup, so it costs no
+remote calls.
+
+Optionally, `--warn-minutes N` (`JB_WARN_MINUTES`) prints a warning and rings the terminal
+bell when N minutes remain (off by default, also free). The only periodic remote call is one
+small `squeue` every `--check-secs` (default 30) to notice if the job died; raise it to
+check less often.
 
 ## Using it from another machine on your LAN
 
